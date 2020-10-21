@@ -1212,6 +1212,8 @@ static struct janus_json_parameter create_parameters[] = {
 	{"bitrate", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"bitrate_cap", JANUS_JSON_BOOL, 0},
 	{"fir_freq", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"pli_cooldown", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	{"pli_max_delay", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"publishers", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"audiocodec", JSON_STRING, 0},
 	{"videocodec", JSON_STRING, 0},
@@ -1431,6 +1433,8 @@ typedef struct janus_videoroom {
 	uint32_t bitrate;			/* Global bitrate limit */
 	gboolean bitrate_cap;		/* Whether the above limit is insormountable */
 	uint16_t fir_freq;			/* Regular FIR frequency (0=disabled) */
+	uint16_t pli_cooldown;      /* */
+	uint16_t pli_max_delay;     /* */
 	janus_audiocodec acodec[3];	/* Audio codec(s) to force on publishers */
 	janus_videocodec vcodec[3];	/* Video codec(s) to force on publishers */
 	char *vp9_profile;			/* VP9 codec profile to prefer, if more are negotiated */
@@ -1593,6 +1597,7 @@ typedef struct janus_videoroom_publisher {
 	gint64 remb_startup;/* Incremental changes on REMB to reach the target at startup */
 	gint64 remb_latest;	/* Time of latest sent REMB (to avoid flooding) */
 	gint64 fir_latest;	/* Time of latest sent FIR (to avoid flooding) */
+	gint64 pli_req_latest; /* Time of latest PLI request (to avoid flooding) */
 	gint fir_seq;		/* FIR sequence number */
 	gboolean recording_active;	/* Whether this publisher has to be recorded or not */
 	gchar *recording_base;	/* Base name for the recording (e.g., /path/to/filename, will generate /path/to/filename-audio.mjr and/or /path/to/filename-video.mjr */
@@ -1818,12 +1823,21 @@ static void janus_videoroom_codecstr(janus_videoroom *videoroom, char *audio_cod
 static void janus_videoroom_reqpli(janus_videoroom_publisher *publisher, const char *reason) {
 	if(publisher == NULL)
 		return;
+
+	gint64 now = janus_get_monotonic_time();
+
+	if(now-publisher->pli_req_latest > publisher->room->pli_cooldown && now-publisher->fir_latest < publisher->room->pli_max_delay) {
+		publisher->pli_req_latest = now;
+		return;
+	}
+
 	/* Send a PLI */
 	JANUS_LOG(LOG_VERB, "%s sending PLI to %s (%s)\n", reason,
 		publisher->user_id_str, publisher->display ? publisher->display : "??");
 	gateway->send_pli(publisher->session->handle);
 	/* Update the time of when we last sent a keyframe request */
-	publisher->fir_latest = janus_get_monotonic_time();
+	publisher->fir_latest = now;
+	publisher->pli_req_latest = now;
 }
 
 /* Error codes */
@@ -2144,6 +2158,8 @@ int janus_videoroom_init(janus_callbacks *callback, const char *config_path) {
 			janus_config_item *bitrate_cap = janus_config_get(config, cat, janus_config_type_item, "bitrate_cap");
 			janus_config_item *maxp = janus_config_get(config, cat, janus_config_type_item, "publishers");
 			janus_config_item *firfreq = janus_config_get(config, cat, janus_config_type_item, "fir_freq");
+			janus_config_item *plicooldown = janus_config_get(config, cat, janus_config_type_item, "pli_cooldown");
+			janus_config_item *plimaxdelay = janus_config_get(config, cat, janus_config_type_item, "pli_max_delay");
 			janus_config_item *audiocodec = janus_config_get(config, cat, janus_config_type_item, "audiocodec");
 			janus_config_item *videocodec = janus_config_get(config, cat, janus_config_type_item, "videocodec");
 			janus_config_item *vp9profile = janus_config_get(config, cat, janus_config_type_item, "vp9_profile");
@@ -2226,6 +2242,14 @@ int janus_videoroom_init(janus_callbacks *callback, const char *config_path) {
 			videoroom->fir_freq = 0;
 			if(firfreq != NULL && firfreq->value != NULL)
 				videoroom->fir_freq = atol(firfreq->value);
+			videoroom->pli_cooldown = 0;
+			if(plicooldown != NULL && plicooldown->value != NULL)
+			    videoroom->pli_cooldown = atol(plicooldown->value);
+			videoroom->pli_max_delay = videoroom->pli_cooldown;
+			if(plimaxdelay != NULL && plimaxdelay->value != NULL) {
+			    videoroom->pli_max_delay = atol(plimaxdelay->value);
+				videoroom->pli_max_delay = videoroom->pli_cooldown > videoroom->pli_max_delay ? videoroom->pli_cooldown : videoroom->pli_max_delay;
+			}
 			/* By default, we force Opus as the only audio codec */
 			videoroom->acodec[0] = JANUS_AUDIOCODEC_OPUS;
 			videoroom->acodec[1] = JANUS_AUDIOCODEC_NONE;
@@ -2899,6 +2923,8 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 		json_t *bitrate = json_object_get(root, "bitrate");
 		json_t *bitrate_cap = json_object_get(root, "bitrate_cap");
 		json_t *fir_freq = json_object_get(root, "fir_freq");
+		json_t *pli_cooldown = json_object_get(root, "pli_cooldown");
+		json_t *pli_max_delay = json_object_get(root, "pli_max_delay");
 		json_t *publishers = json_object_get(root, "publishers");
 		json_t *allowed = json_object_get(root, "allowed");
 		json_t *audiocodec = json_object_get(root, "audiocodec");
@@ -3073,6 +3099,12 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 		videoroom->fir_freq = 0;
 		if(fir_freq)
 			videoroom->fir_freq = json_integer_value(fir_freq);
+		videoroom->pli_cooldown = 0;
+		if(pli_cooldown)
+		    videoroom->pli_cooldown = json_integer_value(pli_cooldown);
+		videoroom->pli_max_delay = 0;
+		if(pli_max_delay)
+		    videoroom->pli_max_delay = json_integer_value(pli_max_delay);
 		/* By default, we force Opus as the only audio codec */
 		videoroom->acodec[0] = JANUS_AUDIOCODEC_OPUS;
 		videoroom->acodec[1] = JANUS_AUDIOCODEC_NONE;
@@ -3243,6 +3275,14 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 			if(videoroom->fir_freq) {
 				g_snprintf(value, BUFSIZ, "%"SCNu16, videoroom->fir_freq);
 				janus_config_add(config, c, janus_config_item_create("fir_freq", value));
+			}
+			if(videoroom->pli_cooldown) {
+				g_snprintf(value, BUFSIZ, "%"SCNu16, videoroom->pli_cooldown);
+				janus_config_add(config, c, janus_config_item_create("pli_cooldown", value));
+			}
+			if(videoroom->pli_max_delay) {
+				g_snprintf(value, BUFSIZ, "%"SCNu16, videoroom->pli_max_delay);
+				janus_config_add(config, c, janus_config_item_create("pli_max_delay", value));
 			}
 			char video_codecs[100];
 			char audio_codecs[100];
@@ -3628,6 +3668,8 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 				if(room->bitrate_cap)
 					json_object_set_new(rl, "bitrate_cap", json_true());
 				json_object_set_new(rl, "fir_freq", json_integer(room->fir_freq));
+				json_object_set_new(rl, "pli_cooldown", json_integer(room->pli_cooldown));
+				json_object_set_new(rl, "pli_max_delay", json_integer(room->pli_max_delay));
 				json_object_set_new(rl, "require_pvtid", room->require_pvtid ? json_true() : json_false());
 				json_object_set_new(rl, "require_e2ee", room->require_e2ee ? json_true() : json_false());
 				json_object_set_new(rl, "notify_joining", room->notify_joining ? json_true() : json_false());
@@ -5130,6 +5172,15 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
 				gateway->send_remb(handle, bitrate);
 				if(participant->remb_startup == 0)
 					participant->remb_latest = janus_get_monotonic_time();
+			}
+			/* Generate PLI, if latest one was delayed, because of cooldown */
+			if(video && participant->video_active && participant->fir_latest < participant->pli_req_latest) {
+				gint64 now = janus_get_monotonic_time();
+				if(now-participant->fir_latest >= ((gint64)videoroom->pli_max_delay*G_USEC_PER_SEC)) {
+					janus_videoroom_reqpli(participant, "PLI max delay reached");
+				} else if(now-participant->pli_req_latest >= ((gint64)videoroom->pli_cooldown*G_USEC_PER_SEC)) {
+					janus_videoroom_reqpli(participant, "PLI cooldown");
+				}
 			}
 			/* Generate FIR/PLI too, if needed */
 			if(video && participant->video_active && (videoroom->fir_freq > 0)) {
