@@ -1826,7 +1826,8 @@ static void janus_videoroom_reqpli(janus_videoroom_publisher *publisher, const c
 
 	gint64 now = janus_get_monotonic_time();
 
-	if(now-publisher->pli_req_latest > publisher->room->pli_cooldown && now-publisher->fir_latest < publisher->room->pli_max_delay) {
+	if(now-publisher->pli_req_latest > ((gint64)publisher->room->pli_cooldown*G_USEC_PER_SEC) &&
+			now-publisher->fir_latest < ((gint64)publisher->room->pli_max_delay*G_USEC_PER_SEC)) {
 		publisher->pli_req_latest = now;
 		return;
 	}
